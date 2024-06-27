@@ -93,18 +93,29 @@ pub struct Contract {
     // Block with the highest chainWork, i.e., blockchain tip, you can find latest height inside of it
     mainchain_tip_blockhash: String,
 
+    // The oldest block in main chain we store
+    mainchain_initial_blockhash: String,
+
     // Mapping of block hashes to block headers (ALL ever submitted, i.e., incl. forks)
     headers_pool: near_sdk::store::LookupMap<String, state::Header>,
 
     // If we should run all the block checks or not
     enable_check: bool,
+
+    // GC threshold - how many blocks we would like to store in memory, and GC the older ones
+    gc_threshold: u32,
 }
 
 // Implement the contract structure
 #[near]
 impl Contract {
     #[init]
-    pub fn new(genesis_block: Header, genesis_block_height: u64, enable_check: bool) -> Self {
+    pub fn new(
+        genesis_block: Header,
+        genesis_block_height: u64,
+        enable_check: bool,
+        gc_threshold: u32,
+    ) -> Self {
         log!("Running the initialization!");
 
         let mut contract = Self {
@@ -115,8 +126,10 @@ impl Contract {
                 StorageKey::MainchainHeaderToHeight,
             ),
             headers_pool: near_sdk::store::LookupMap::new(StorageKey::HeadersPool),
+            mainchain_initial_blockhash: String::new(),
             mainchain_tip_blockhash: String::new(),
             enable_check,
+            gc_threshold,
         };
 
         contract.init_genesis(genesis_block, genesis_block_height);
@@ -124,15 +137,16 @@ impl Contract {
         contract
     }
 
-    fn init_genesis(&mut self, block_header: Header, block_height: u64) -> bool {
+    fn init_genesis(&mut self, block_header: Header, block_height: u64) {
         let current_block_hash = block_header.block_hash().as_raw_hash().to_string();
         let chainwork_bytes = block_header.work().to_be_bytes();
 
         let header = state::Header::new(block_header, chainwork_bytes, block_height);
 
         self.store_block_header(current_block_hash.clone(), &header);
+        self.mainchain_initial_blockhash
+            .clone_from(&current_block_hash);
         self.mainchain_tip_blockhash = current_block_hash;
-        true
     }
 
     pub fn get_last_block_header(&self) -> state::Header {
@@ -388,6 +402,50 @@ impl Contract {
             false
         }
     }
+
+    // Current GC implementation is doing full travers of the blocks starting from the main chain
+    // tip. We can optimize this, by storing the height of a current genesis block in our state.
+    pub fn run_mainchain_gc(&mut self, batch_size: u8) {
+        let initial_blockheader = self
+            .headers_pool
+            .get(&self.mainchain_initial_blockhash)
+            .expect("initial blockheader must be in a header pool");
+
+        let tip_blockheader = self
+            .headers_pool
+            .get(&self.mainchain_tip_blockhash)
+            .expect("tip blockheader must be in a header pool");
+
+        let amount_of_headers_we_store =
+            tip_blockheader.block_height - initial_blockheader.block_height;
+
+        if amount_of_headers_we_store > self.gc_threshold as u64 {
+            let total_amount_to_remove = amount_of_headers_we_store - self.gc_threshold as u64;
+            let selected_amount_to_remove =
+                std::cmp::min(total_amount_to_remove, batch_size as u64);
+
+            let start_removal_height = initial_blockheader.block_height;
+            let end_removal_height = initial_blockheader.block_height + selected_amount_to_remove;
+
+            for height in start_removal_height..end_removal_height {
+                let blockhash = self
+                    .mainchain_height_to_header
+                    .get(&height)
+                    .expect("target height should exist")
+                    .to_string();
+
+                self.mainchain_header_to_height.remove(&blockhash);
+                self.mainchain_height_to_header.remove(&height);
+                self.headers_pool.remove(&blockhash);
+            }
+
+            let new_initial_blockhash = self
+                .mainchain_height_to_header
+                .get(&end_removal_height)
+                .expect("target height should exist");
+            self.mainchain_initial_blockhash = new_initial_blockhash.to_string();
+        }
+    }
 }
 
 /*
@@ -461,7 +519,7 @@ mod tests {
     fn test_saving_mainchain_block_header() {
         let header = block_header_example();
 
-        let mut contract = Contract::new(genesis_block_header(), 0, true);
+        let mut contract = Contract::new(genesis_block_header(), 0, true, 3);
 
         contract.submit_block_header(header).unwrap();
 
@@ -484,7 +542,7 @@ mod tests {
     fn test_submitting_new_fork_block_header() {
         let header = block_header_example();
 
-        let mut contract = Contract::new(genesis_block_header(), 0, true);
+        let mut contract = Contract::new(genesis_block_header(), 0, true, 3);
 
         contract.submit_block_header(header).unwrap();
 
@@ -510,7 +568,7 @@ mod tests {
     // test we can insert a block and get block back by it's height
     #[test]
     fn test_getting_block_by_height() {
-        let mut contract = Contract::new(genesis_block_header(), 0, true);
+        let mut contract = Contract::new(genesis_block_header(), 0, true, 3);
 
         contract
             .submit_block_header(block_header_example())
@@ -528,7 +586,7 @@ mod tests {
 
     #[test]
     fn test_getting_height_by_block() {
-        let mut contract = Contract::new(genesis_block_header(), 0, true);
+        let mut contract = Contract::new(genesis_block_header(), 0, true, 3);
 
         contract
             .submit_block_header(block_header_example())
@@ -550,7 +608,7 @@ mod tests {
 
     #[test]
     fn test_submitting_existing_fork_block_header_and_promote_fork() {
-        let mut contract = Contract::new(genesis_block_header(), 0, true);
+        let mut contract = Contract::new(genesis_block_header(), 0, true, 3);
 
         contract
             .submit_block_header(block_header_example())
@@ -580,7 +638,7 @@ mod tests {
 
     #[test]
     fn test_getting_an_error_if_submitting_unattached_block() {
-        let mut contract = Contract::new(genesis_block_header(), 0, true);
+        let mut contract = Contract::new(genesis_block_header(), 0, true, 3);
 
         let result = contract.submit_block_header(fork_block_header_example_2());
         assert!(result.is_err());
